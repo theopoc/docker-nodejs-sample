@@ -1,0 +1,110 @@
+# ========================================
+# Optimized Multi-Stage Dockerfile
+# Node.js TypeScript Application
+# ========================================
+
+ARG NODE_VERSION=24.11.1-alpine
+FROM node:${NODE_VERSION} AS base
+
+WORKDIR /app
+
+COPY package*.json ./
+
+RUN --mount=type=cache,target=/root/.npm,sharing=locked \
+    npm ci && \
+    npm cache clean --force
+
+COPY . .
+
+RUN npm run build
+
+
+# ========================================
+# Dev Dependencies Stage
+# ========================================
+FROM node:${NODE_VERSION} AS development
+
+ENV NODE_ENV=development \
+    NPM_CONFIG_LOGLEVEL=warn
+
+WORKDIR /app
+
+# Copy production dependencies from deps stage
+COPY --from=base /app/node_modules ./node_modules
+COPY --from=base /app/package*.json ./
+# Copy built application from build stage
+COPY --from=base /app/dist ./dist
+
+# Expose ports
+EXPOSE 3000 5173 9229
+
+CMD ["npm", "run", "dev:docker"]
+
+
+# ========================================
+# Prod Dependencies Stage
+# ========================================
+FROM base AS prod-deps
+
+WORKDIR /app
+
+# Copy package files
+COPY package*.json ./
+
+# Install production dependencies
+RUN --mount=type=cache,target=/root/.npm,sharing=locked \
+    npm ci --only=production && \
+    npm cache clean --force
+
+# ========================================
+# Production Stage
+# ========================================
+
+FROM alpine:3.23.2 AS production
+
+# Set optimized environment variables
+ENV NODE_ENV=production \
+    NODE_OPTIONS="--max-old-space-size=256 --no-warnings" \
+    NPM_CONFIG_LOGLEVEL=silent
+
+# Set working directory
+WORKDIR /app
+
+RUN apk add --no-cache libstdc++ dumb-init \
+  && addgroup -g 1000 node && adduser -u 1000 -G node -s /bin/sh -D node \
+  && chown node:node ./
+
+COPY --from=base /usr/local/bin/node /usr/local/bin/
+COPY --from=base /usr/local/bin/docker-entrypoint.sh /usr/local/bin/
+
+ENTRYPOINT ["docker-entrypoint.sh"]
+USER node
+
+# Copy production dependencies from deps stage
+COPY --from=prod-deps --chown=nodejs:nodejs /app/node_modules ./node_modules
+# Copy built application from build stage
+COPY --from=base --chown=nodejs:nodejs /app/dist ./dist
+
+# Expose port
+EXPOSE 3000
+
+# Start production server
+CMD ["dumb-init", "node", "dist/index.js"]
+
+# ========================================
+# Test Stage
+# ========================================
+FROM base AS test
+
+# Set environment
+ENV NODE_ENV=test \
+    CI=true
+
+# Copy source files
+COPY --chown=nodejs:nodejs . .
+
+# Switch to non-root user
+USER nodejs
+
+# Run tests with coverage
+CMD ["npm", "run", "test:coverage"]
